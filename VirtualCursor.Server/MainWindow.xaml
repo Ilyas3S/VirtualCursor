@@ -8,7 +8,16 @@
         Topmost="True"
         WindowState="Maximized">
     <Canvas x:Name="MainCanvas">
-        <Image x:Name="Sprite" Width="32" Height="32" Source="/VirtualCursor1.png" Canvas.Left="42" Canvas.Top="75"/>
+        <Image x:Name="RemoteSprite" Width="32" Height="32" Source="/VirtualCursor1.png" Canvas.Left="42" Canvas.Top="75" Cursor="No">
+            <Image.Effect>
+                <DropShadowEffect/>
+            </Image.Effect>
+        </Image>
+        <Image x:Name="LocalSprite" Width="32" Height="32" Source="/VirtualCursor1.png" Canvas.Left="79" Canvas.Top="75" HorizontalAlignment="Left" VerticalAlignment="Center" Cursor="No">
+            <Image.Effect>
+                <DropShadowEffect/>
+            </Image.Effect>
+        </Image>
         <TextBlock x:Name="SessionIdText" Foreground="White" Background="Black" Padding="5" 
            Margin="10,10,0,0" FontSize="14" FontWeight="Bold"/>
         <TextBlock x:Name="StatusTextBlock" Foreground="White" Background="Black" Padding="5" 

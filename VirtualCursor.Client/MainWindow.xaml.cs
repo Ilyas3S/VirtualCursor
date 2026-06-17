@@ -76,7 +76,8 @@ namespace VirtualCursor.Client
 						{
 							var controlWindow = new CursorControlWindow(_udpClient);
 							controlWindow.Show();
-							this.Hide();
+							//this.Hide();
+							this.Close();
 						});
 					});
 				}
@@ -90,8 +91,8 @@ namespace VirtualCursor.Client
 
 		protected override void OnClosed(EventArgs e)
 		{
-			_udpClient?.Dispose();
-			_signalingClient?.Dispose();
+			//_udpClient?.Dispose();
+			//_signalingClient?.Dispose();
 			base.OnClosed(e);
 		}
 	}

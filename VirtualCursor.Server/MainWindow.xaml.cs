@@ -24,19 +24,95 @@ namespace VirtualCursor.Server
 		private SignalingClient _signalingClient;
 		private readonly string _mySessionId = GenerateShortSessionId();
 
+
+		// Размеры спрайтов (в пикселях)
 		private double _spriteWidth, _spriteHeight;
 		private double _maxX, _maxY;
 
+		// -------------------- NEW: состояния курсоров --------------------
+		// Позиции спрайтов в экранных координатах
+		private Point _localCursorPos;    // позиция основного курсора (фантом)
+		private Point _remoteCursorPos;   // позиция удалённого курсора
+
+		// Состояние захвата
+		private bool _isDraggingByRemote = false;
+		private Point _localCursorPosAtDragStart; // позиция фантома в момент начала захвата
+
+		// -------------------- NEW: глобальный хук мыши --------------------
+		private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+		private HookProc _mouseHookProc;
+		private IntPtr _mouseHookId = IntPtr.Zero;
+		private Point _mousePosPrev = new Point();
+
+		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+		private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+		private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+		private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+		[DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+		private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+		private const int WH_MOUSE_LL = 14;
+
+		// Структура для получения координат из хука
+		[StructLayout(LayoutKind.Sequential)]
+		private struct POINTAPI
+		{
+			public int x;
+			public int y;
+		}
+
+		[StructLayout(LayoutKind.Sequential)]
+		private struct MSLLHOOKSTRUCT
+		{
+			public POINTAPI pt;
+			public uint mouseData;
+			public uint flags;
+			public uint time;
+			public IntPtr dwExtraInfo;
+		}
+
+		// -------------------- Остальные импорты --------------------
 		[DllImport("user32.dll")]
 		private static extern bool GetCursorPos(out POINT lpPoint);
 		[DllImport("user32.dll")]
 		private static extern bool SetCursorPos(int x, int y);
 		[StructLayout(LayoutKind.Sequential)]
 		public struct POINT { public int X; public int Y; }
+
 		[DllImport("user32.dll")]
 		private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+		private const uint MOUSEEVENTF_WHEEL = 0x0800;
 		private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
 		private const uint MOUSEEVENTF_LEFTUP = 0x0004;
+		private const uint MOUSEEVENTF_MOVE = 0x0001;
+		private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+		private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+		private const IntPtr EMULATED_MOUSE_FLAG = (IntPtr)0x12345678; // маркер
+
+		private void mouse_event_emulated(uint dwFlags, uint dx, uint dy)
+		{
+			mouse_event(dwFlags, dx, dy, 0, (nuint)EMULATED_MOUSE_FLAG);
+		}
+
+		[DllImport("user32.dll")]
+		static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+		private const uint KEYEVENTF_KEYDOWN = 0x0000;
+		private const uint KEYEVENTF_KEYUP = 0x0002;
+
+		[DllImport("user32.dll")]
+		private static extern int GetSystemMetrics(int nIndex);
+		private const int SM_CXSCREEN = 0;
+		private const int SM_CYSCREEN = 1;
+
+		private double _screenWidth;
+		private double _screenHeight;
 
 		private static readonly Random _random = new Random();
 		private static string GenerateShortSessionId() =>
@@ -53,13 +129,25 @@ namespace VirtualCursor.Server
 		private void OnLoaded(object sender, RoutedEventArgs e)
 		{
 			SessionIdText.Text = $"ID: {_mySessionId}";
-			_spriteWidth = Sprite.ActualWidth;
-			_spriteHeight = Sprite.ActualHeight;
+
+			_spriteWidth = RemoteSprite.ActualWidth;   // предполагаем, что оба спрайта одинакового размера
+			_spriteHeight = RemoteSprite.ActualHeight;
 			_maxX = SystemParameters.PrimaryScreenWidth - _spriteWidth;
 			_maxY = SystemParameters.PrimaryScreenHeight - _spriteHeight;
-			double startX = (SystemParameters.PrimaryScreenWidth - _spriteWidth) / 2;
-			double startY = (SystemParameters.PrimaryScreenHeight - _spriteHeight) / 2;
-			SetSpritePosition(startX, startY);
+			_screenWidth = GetSystemMetrics(SM_CXSCREEN);
+			_screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+			// Начальные позиции: основной в центре, удалённый чуть сбоку
+			double startXLocal = (SystemParameters.PrimaryScreenWidth - _spriteWidth) / 2;
+			double startYLocal = (SystemParameters.PrimaryScreenHeight - _spriteHeight) / 2;
+			_localCursorPos = new Point(startXLocal, startYLocal);
+			_remoteCursorPos = new Point(startXLocal + 50, startYLocal + 50); // сместим для наглядности
+
+			UpdateSprites();
+
+			// -------------------- NEW: запуск глобального хука мыши --------------------
+			StartGlobalMouseHook();
+
 			_ = SetupNetworkingAsync();
 		}
 
@@ -70,24 +158,249 @@ namespace VirtualCursor.Server
 			SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TRANSPARENT | WS_EX_LAYERED);
 		}
 
-		private void SetSpritePosition(double x, double y)
+		// -------------------- NEW: обновление позиций спрайтов --------------------
+		private void UpdateSprites()
 		{
-			x = Math.Max(0, Math.Min(x, _maxX));
-			y = Math.Max(0, Math.Min(y, _maxY));
 			Dispatcher.Invoke(() =>
 			{
-				Canvas.SetLeft(Sprite, x);
-				Canvas.SetTop(Sprite, y);
+				Canvas.SetLeft(RemoteSprite, _remoteCursorPos.X);
+				Canvas.SetTop(RemoteSprite, _remoteCursorPos.Y);
+				Canvas.SetLeft(LocalSprite, _localCursorPos.X);
+				Canvas.SetTop(LocalSprite, _localCursorPos.Y);
 			});
+		}
+
+		private Point ConverseNormalPoint(double x, double y)
+		{
+			return new Point(x * _screenWidth, y * _screenHeight);
+		}
+
+		// -------------------- Обработка команд от клиента --------------------
+		private void OnUdpDataReceived(IPEndPoint remote, byte[] data)
+		{
+			string json = Encoding.UTF8.GetString(data);
+			Debug.WriteLine($"Server received: {json}");
+			var cmd = JsonSerializer.Deserialize<CursorCommand>(json);
+			if (cmd == null)
+			{
+				Debug.WriteLine("Deserialization failed");
+				return;
+			}
+
+			Dispatcher.Invoke(() =>
+			{
+				switch (cmd.Type)
+				{
+					case "MOVE":
+						_remoteCursorPos = ConverseNormalPoint(cmd.X, cmd.Y);
+						if (_isDraggingByRemote)
+						{
+							// Двигаем системный курсор за удалённым курсором
+							SetSystemCursorPosition(_remoteCursorPos);
+							// Синхронизируем _mousePosPrev, чтобы следующий дельта в хуке считался от новой позиции
+						}
+						UpdateSprites();
+						break;
+
+					case "LEFT_DOWN":
+						if (!_isDraggingByRemote)
+						{
+							// Начинаем захват
+							StartRemoteDrag();
+						}
+						break;
+
+					case "LEFT_UP":
+						if (_isDraggingByRemote)
+						{
+							// Завершаем захват
+							StopRemoteDrag();
+						}
+						break;
+
+					case "RIGHT_DOWN":
+						if (!_isDraggingByRemote)
+						{
+							PerformRightButtonDown();
+						}
+						break;
+
+					case "RIGHT_UP":
+						if (_isDraggingByRemote)
+						{
+							PerformRightButtonUp();
+						}
+						break;
+
+					case "HOVER":
+						if (!_isDraggingByRemote)
+						{
+							_ = PerformHoverAsync(); // асинхронный запуск, не ждём
+						}
+						break;
+
+					case "WHEEL":
+						int delta = (int)cmd.Y;
+						PerformWheel(delta);
+						break;
+					case "LSHIFT_DOWN":
+						keybd_event((byte)0xA0, 0, KEYEVENTF_KEYDOWN, UIntPtr.Zero);
+						break;
+					case "LSHIFT_UP":
+						keybd_event((byte)0xA0, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+						break;
+					case "LCTRL_DOWN":
+						keybd_event((byte)0xA2, 0, KEYEVENTF_KEYDOWN, UIntPtr.Zero);
+						break;
+					case "LCTRL_UP":
+						keybd_event((byte)0xA2, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+						break;
+					case "LALT_DOWN":
+						keybd_event((byte)0xA4, 0, KEYEVENTF_KEYDOWN, UIntPtr.Zero);
+						break;
+					case "LALT_UP":
+						keybd_event((byte)0xA4, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+						break;
+					case "SPACE_DOWN":
+						keybd_event((byte)0x20, 0, KEYEVENTF_KEYDOWN, UIntPtr.Zero);
+						break;
+					case "SPACE_UP":
+						keybd_event((byte)0x20, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+						break;
+					case "TAB_DOWN":
+						keybd_event((byte)0x09, 0, KEYEVENTF_KEYDOWN, UIntPtr.Zero);
+						break;
+					case "TAB_UP":
+						keybd_event((byte)0x09, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+						break;
+				}
+			});
+		}
+
+		private void SetSystemCursorPosition(Point pos)
+		{
+			SetCursorPos((int)pos.X, (int)pos.Y);
+			_mousePosPrev = pos;
+		}
+
+		// -------------------- NEW: методы управления --------------------
+		private void PerformWheel(int delta)
+		{
+			// Перемещаем курсор в позицию удалённого курсора (опционально, чтобы колесо прокручивалось там)
+			SetSystemCursorPosition(_remoteCursorPos);
+			// эмулируем колесо
+			mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (uint)delta, (UIntPtr)EMULATED_MOUSE_FLAG);
+		}
+		private void StartRemoteDrag()
+		{
+			SetSystemCursorPosition(_remoteCursorPos);
+			mouse_event_emulated(MOUSEEVENTF_LEFTDOWN, 0, 0);
+			_isDraggingByRemote = true;
+		}
+
+		private void StopRemoteDrag()
+		{
+			mouse_event_emulated(MOUSEEVENTF_LEFTUP, 0, 0);
+			_isDraggingByRemote = false;
+			SetSystemCursorPosition(_localCursorPos);
 		}
 
 		private void PerformClickAt(int x, int y)
 		{
 			GetCursorPos(out POINT originalPos);
-			SetCursorPos(x, y);
-			mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
-			mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
-			SetCursorPos(originalPos.X, originalPos.Y);
+			SetSystemCursorPosition(new Point(x, y)); // временно
+			mouse_event_emulated(MOUSEEVENTF_LEFTDOWN, 0, 0);
+			mouse_event_emulated(MOUSEEVENTF_LEFTUP, 0, 0);
+			SetSystemCursorPosition(new Point(originalPos.X, originalPos.Y));
+		}
+
+		private void PerformRightButtonDown()
+		{
+			// Перемещаем системный курсор на позицию удалённого курсора
+			SetSystemCursorPosition(_remoteCursorPos);
+			mouse_event_emulated(MOUSEEVENTF_RIGHTDOWN, 0, 0);
+			_isDraggingByRemote = true;
+		}
+
+		private void PerformRightButtonUp()
+		{
+			mouse_event_emulated(MOUSEEVENTF_RIGHTUP, 0, 0);
+			_isDraggingByRemote = false;
+			SetSystemCursorPosition(_localCursorPos);
+		}
+
+		private async Task PerformHoverAsync()
+		{
+			GetCursorPos(out POINT originalPos);
+			Point originalPoint = new Point(originalPos.X, originalPos.Y);
+			SetSystemCursorPosition(_remoteCursorPos);
+			// Ждём 100 мс – достаточно для появления подсказок (ToolTip)
+			await Task.Delay(100);
+			SetSystemCursorPosition(originalPoint);
+		}
+
+		// -------------------- NEW: глобальный хук мыши --------------------
+		private void StartGlobalMouseHook()
+		{
+			_mouseHookProc = MouseHookCallback;
+			using (Process curProcess = Process.GetCurrentProcess())
+			using (ProcessModule curModule = curProcess.MainModule)
+			{
+				_mouseHookId = SetWindowsHookEx(WH_MOUSE_LL, _mouseHookProc,
+					GetModuleHandle(curModule.ModuleName), 0);
+				if (_mouseHookId == IntPtr.Zero)
+				{
+					Debug.WriteLine("Не удалось установить хук мыши");
+				}
+			}
+		}
+
+		private void StopGlobalMouseHook()
+		{
+			if (_mouseHookId != IntPtr.Zero)
+			{
+				UnhookWindowsHookEx(_mouseHookId);
+				_mouseHookId = IntPtr.Zero;
+			}
+		}
+
+		private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+		{
+			if (nCode >= 0)
+			{
+				MSLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+				// Если событие от нас – пропускаем без блокировки
+				if (hookStruct.dwExtraInfo == EMULATED_MOUSE_FLAG)
+					return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
+
+				Point mousePos = new Point(hookStruct.pt.x, hookStruct.pt.y);
+				Vector delta = mousePos - _mousePosPrev;
+
+				if (_isDraggingByRemote)
+				{
+					// Обновляем фантом только при движении мыши (wParam == WM_MOUSEMOVE)
+					// Чтобы не обрабатывать нажатия кнопок как движения
+					if (wParam == (IntPtr)0x0200) // WM_MOUSEMOVE
+					{
+						_localCursorPos += delta;
+						UpdateSprites();
+					}
+					// Блокируем все события (кроме наших), чтобы реальная мышь не влияла на системный курсор
+					return (IntPtr)1;
+				}
+				else
+				{
+					// Свободный режим: обновляем фантом, системный курсор управляется реальной мышью
+					if (wParam == (IntPtr)0x0200)
+					{
+						_localCursorPos = mousePos;
+						_mousePosPrev = mousePos;
+						UpdateSprites();
+					}
+					return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
+				}
+			}
+			return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
 		}
 
 		private async Task SetupNetworkingAsync()
@@ -146,23 +459,6 @@ namespace VirtualCursor.Server
 					Dispatcher.Invoke(() => StatusTextBlock.Text = $"Начинаем hole punching с клиентом {clientEndPoint}");
 				}
 			}
-		}
-
-		private void OnUdpDataReceived(IPEndPoint remote, byte[] data)
-		{
-			string json = Encoding.UTF8.GetString(data);
-			Debug.WriteLine($"Server received: {json}");  // важно: смотрим, что приходит
-			var cmd = JsonSerializer.Deserialize<CursorCommand>(json);
-			if (cmd == null)
-			{
-				Debug.WriteLine("Deserialization failed");
-				return;
-			}
-
-			if (cmd.Type == "MOVE")
-				Dispatcher.Invoke(() => SetSpritePosition(cmd.X, cmd.Y));
-			else if (cmd.Type == "CLICK")
-				Dispatcher.Invoke(() => PerformClickAt((int)cmd.X, (int)cmd.Y));
 		}
 
 		private async void OnClosed(object sender, EventArgs e)

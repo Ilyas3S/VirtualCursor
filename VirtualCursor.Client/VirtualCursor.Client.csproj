@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Remove="VirtualCursor1.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SocketJack" Version="2026.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\VirtualCursor.Common\VirtualCursor.Common.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="VirtualCursor1.png" />
+  </ItemGroup>
+
+</Project>

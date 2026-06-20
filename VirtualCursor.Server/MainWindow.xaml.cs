@@ -35,14 +35,19 @@ namespace VirtualCursor.Server
 		private Point _remoteCursorPos;   // позиция удалённого курсора
 
 		// Состояние захвата
-		private bool _isDraggingByRemote = false;
-		private Point _localCursorPosAtDragStart; // позиция фантома в момент начала захвата
+		private bool _isBlockedByRemote = false;
+		private bool _isTakedByRemote = false;
 
 		// -------------------- NEW: глобальный хук мыши --------------------
 		private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
 		private HookProc _mouseHookProc;
 		private IntPtr _mouseHookId = IntPtr.Zero;
 		private Point _mousePosPrev = new Point();
+
+		// Поля
+		private bool _needUpdateSprites = false;
+		private object _updateLock = new object();
+		
 
 		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
 		private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
@@ -114,6 +119,19 @@ namespace VirtualCursor.Server
 		private double _screenWidth;
 		private double _screenHeight;
 
+		[DllImport("user32.dll")]
+		private static extern short GetAsyncKeyState(int vKey);
+
+		// Виртуальные коды для кнопок мыши
+		private const int VK_LBUTTON = 0x01;
+		private const int VK_RBUTTON = 0x02;
+		private const int VK_MBUTTON = 0x04; // средняя кнопка (если понадобится)
+		private bool IsMouseButtonPressed(int vKey)
+		{
+			// Старший бит (0x8000) показывает, зажата ли кнопка в данный момент
+			return (GetAsyncKeyState(vKey) & 0x8000) != 0;
+		}
+
 		private static readonly Random _random = new Random();
 		private static string GenerateShortSessionId() =>
 			new string(Enumerable.Range(0, 6).Select(_ => "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[_random.Next(36)]).ToArray());
@@ -124,6 +142,8 @@ namespace VirtualCursor.Server
 			Loaded += OnLoaded;
 			SourceInitialized += OnSourceInitialized;
 			Closed += OnClosed;
+			// В конструкторе или OnLoaded подписываемся на рендеринг
+			CompositionTarget.Rendering += OnRendering;
 		}
 
 		private void OnLoaded(object sender, RoutedEventArgs e)
@@ -158,16 +178,23 @@ namespace VirtualCursor.Server
 			SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TRANSPARENT | WS_EX_LAYERED);
 		}
 
-		// -------------------- NEW: обновление позиций спрайтов --------------------
+
 		private void UpdateSprites()
 		{
-			Dispatcher.Invoke(() =>
+			// Просто устанавливаем флаг – рендеринг сам обновит позиции
+			_needUpdateSprites = true;
+		}
+		private void OnRendering(object sender, EventArgs e)
+		{
+			if (_needUpdateSprites)
 			{
+				_needUpdateSprites = false;
+				// Обновляем позиции напрямую (уже в UI-потоке)
 				Canvas.SetLeft(RemoteSprite, _remoteCursorPos.X);
 				Canvas.SetTop(RemoteSprite, _remoteCursorPos.Y);
 				Canvas.SetLeft(LocalSprite, _localCursorPos.X);
 				Canvas.SetTop(LocalSprite, _localCursorPos.Y);
-			});
+			}
 		}
 
 		private Point ConverseNormalPoint(double x, double y)
@@ -193,7 +220,7 @@ namespace VirtualCursor.Server
 				{
 					case "MOVE":
 						_remoteCursorPos = ConverseNormalPoint(cmd.X, cmd.Y);
-						if (_isDraggingByRemote)
+						if (_isTakedByRemote)
 						{
 							// Двигаем системный курсор за удалённым курсором
 							SetSystemCursorPosition(_remoteCursorPos);
@@ -203,15 +230,15 @@ namespace VirtualCursor.Server
 						break;
 
 					case "LEFT_DOWN":
-						if (!_isDraggingByRemote)
+						if (true) //!_isDraggingByRemote)
 						{
 							// Начинаем захват
-							StartRemoteDrag();
+							_ = StartRemoteDrag();
 						}
 						break;
 
 					case "LEFT_UP":
-						if (_isDraggingByRemote)
+						if (_isTakedByRemote)
 						{
 							// Завершаем захват
 							StopRemoteDrag();
@@ -219,21 +246,21 @@ namespace VirtualCursor.Server
 						break;
 
 					case "RIGHT_DOWN":
-						if (!_isDraggingByRemote)
+						if (true) //!_isDraggingByRemote)
 						{
-							PerformRightButtonDown();
+							_ = PerformRightButtonDown();
 						}
 						break;
 
 					case "RIGHT_UP":
-						if (_isDraggingByRemote)
+						if (_isTakedByRemote)
 						{
 							PerformRightButtonUp();
 						}
 						break;
 
 					case "HOVER":
-						if (!_isDraggingByRemote)
+						if (!_isTakedByRemote)
 						{
 							_ = PerformHoverAsync(); // асинхронный запуск, не ждём
 						}
@@ -291,17 +318,27 @@ namespace VirtualCursor.Server
 			// эмулируем колесо
 			mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (uint)delta, (UIntPtr)EMULATED_MOUSE_FLAG);
 		}
-		private void StartRemoteDrag()
+		private async Task StartRemoteDrag()
 		{
+			// Сначала принудительно отпускаем все кнопки мыши
+			if (IsMouseButtonPressed(VK_LBUTTON))
+				mouse_event_emulated(MOUSEEVENTF_LEFTUP, 0, 0);
+			if (IsMouseButtonPressed(VK_RBUTTON))
+				mouse_event_emulated(MOUSEEVENTF_RIGHTUP, 0, 0);
+
+			// Перемещаем системный курсор на позицию удалённого курсора
 			SetSystemCursorPosition(_remoteCursorPos);
+			_isTakedByRemote = true;
+			await Task.Delay(50);
 			mouse_event_emulated(MOUSEEVENTF_LEFTDOWN, 0, 0);
-			_isDraggingByRemote = true;
+			_isBlockedByRemote = true;
 		}
 
 		private void StopRemoteDrag()
 		{
 			mouse_event_emulated(MOUSEEVENTF_LEFTUP, 0, 0);
-			_isDraggingByRemote = false;
+			_isTakedByRemote = false;
+			_isBlockedByRemote = false;
 			SetSystemCursorPosition(_localCursorPos);
 		}
 
@@ -314,29 +351,43 @@ namespace VirtualCursor.Server
 			SetSystemCursorPosition(new Point(originalPos.X, originalPos.Y));
 		}
 
-		private void PerformRightButtonDown()
+		private async Task PerformRightButtonDown()
 		{
+			// Сначала принудительно отпускаем все кнопки мыши
+			if (IsMouseButtonPressed(VK_LBUTTON))
+				mouse_event_emulated(MOUSEEVENTF_LEFTUP, 0, 0);
+			if (IsMouseButtonPressed(VK_RBUTTON))
+				mouse_event_emulated(MOUSEEVENTF_RIGHTUP, 0, 0);
+
 			// Перемещаем системный курсор на позицию удалённого курсора
 			SetSystemCursorPosition(_remoteCursorPos);
+			_isTakedByRemote = true;
+			await Task.Delay(50);
 			mouse_event_emulated(MOUSEEVENTF_RIGHTDOWN, 0, 0);
-			_isDraggingByRemote = true;
+			_isBlockedByRemote = true;
 		}
 
 		private void PerformRightButtonUp()
 		{
 			mouse_event_emulated(MOUSEEVENTF_RIGHTUP, 0, 0);
-			_isDraggingByRemote = false;
+			_isTakedByRemote = false;
+			_isBlockedByRemote = false;
 			SetSystemCursorPosition(_localCursorPos);
 		}
 
 		private async Task PerformHoverAsync()
 		{
-			GetCursorPos(out POINT originalPos);
-			Point originalPoint = new Point(originalPos.X, originalPos.Y);
+			// Сначала принудительно отпускаем все кнопки мыши
+			if (IsMouseButtonPressed(VK_LBUTTON))
+				mouse_event_emulated(MOUSEEVENTF_LEFTUP, 0, 0);
+			if (IsMouseButtonPressed(VK_RBUTTON))
+				mouse_event_emulated(MOUSEEVENTF_RIGHTUP, 0, 0);
+
 			SetSystemCursorPosition(_remoteCursorPos);
-			// Ждём 100 мс – достаточно для появления подсказок (ToolTip)
-			await Task.Delay(100);
-			SetSystemCursorPosition(originalPoint);
+			_isTakedByRemote = true;
+			await Task.Delay(1000);
+			_isTakedByRemote = false;
+			SetSystemCursorPosition(_localCursorPos);
 		}
 
 		// -------------------- NEW: глобальный хук мыши --------------------
@@ -376,7 +427,7 @@ namespace VirtualCursor.Server
 				Point mousePos = new Point(hookStruct.pt.x, hookStruct.pt.y);
 				Vector delta = mousePos - _mousePosPrev;
 
-				if (_isDraggingByRemote)
+				if (_isTakedByRemote)
 				{
 					// Обновляем фантом только при движении мыши (wParam == WM_MOUSEMOVE)
 					// Чтобы не обрабатывать нажатия кнопок как движения
@@ -385,8 +436,11 @@ namespace VirtualCursor.Server
 						_localCursorPos += delta;
 						UpdateSprites();
 					}
+					if (_isBlockedByRemote)
 					// Блокируем все события (кроме наших), чтобы реальная мышь не влияла на системный курсор
-					return (IntPtr)1;
+						return (IntPtr)1;
+					else
+						return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
 				}
 				else
 				{
@@ -397,6 +451,7 @@ namespace VirtualCursor.Server
 						_mousePosPrev = mousePos;
 						UpdateSprites();
 					}
+					
 					return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
 				}
 			}

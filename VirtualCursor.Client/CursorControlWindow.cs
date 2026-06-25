@@ -18,11 +18,13 @@ namespace VirtualCursor.Client
 {
 	public class CursorControlWindow : Window
 	{
+		// ---- UDP и графика ----
 		private HolePunchUdpClient _udpClient;
 		private double _spriteWidth, _spriteHeight;
 		private double _maxX, _maxY;
 		private Rectangle _sprite;
 
+		// ---- Движение с клавиатуры ----
 		private HashSet<VirtualKeys> _pressedKeys = new();
 		private Vector _moveDirection = new Vector(0, 0);
 		private double _currentSpeed = 0;
@@ -33,16 +35,58 @@ namespace VirtualCursor.Client
 		private const double AccelerationTime = 0.8;
 		private DateTime _lastUpdateTime;
 
-		// В начало класса, после других импортов
+		// ---- Разрешение экрана ----
 		[DllImport("user32.dll")]
 		private static extern int GetSystemMetrics(int nIndex);
 		private const int SM_CXSCREEN = 0;
 		private const int SM_CYSCREEN = 1;
+		private double _screenWidth, _screenHeight;
 
-		// Поля в классе
-		private double _screenWidth;
-		private double _screenHeight;
+		// ---- Режимы ----
+		private enum ControlMode { Keyboard, Mouse }
+		private ControlMode _currentMode = ControlMode.Keyboard;
 
+		// ---- Хуки ----
+		private IntPtr _keyboardHookId = IntPtr.Zero;
+		private IntPtr _mouseHookId = IntPtr.Zero;
+		private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+		private LowLevelKeyboardProc _keyboardProc;
+		private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+		private LowLevelMouseProc _mouseProc;
+
+		private const int WH_KEYBOARD_LL = 13;
+		private const int WH_MOUSE_LL = 14;
+		private const int WM_KEYDOWN = 0x0100;
+		private const int WM_KEYUP = 0x0101;
+		private const int WM_SYSKEYDOWN = 0x0104;
+		private const int WM_SYSKEYUP = 0x0105;
+		private const int WM_MOUSEMOVE = 0x0200;
+		private const int WM_LBUTTONDOWN = 0x0201;
+		private const int WM_LBUTTONUP = 0x0202;
+		private const int WM_RBUTTONDOWN = 0x0204;
+		private const int WM_RBUTTONUP = 0x0205;
+		private const int WM_MBUTTONDOWN = 0x0207;
+		private const int WM_MBUTTONUP = 0x0208;
+		private const int WM_MOUSEWHEEL = 0x020A;
+
+		// Структура для мышиного хука
+		[StructLayout(LayoutKind.Sequential)]
+		private struct POINT
+		{
+			public int x;
+			public int y;
+		}
+		[StructLayout(LayoutKind.Sequential)]
+		private struct MSLLHOOKSTRUCT
+		{
+			public POINT pt;
+			public uint mouseData;
+			public uint flags;
+			public uint time;
+			public IntPtr dwExtraInfo;
+		}
+
+		// ---- Клавиши ----
 		private enum VirtualKeys
 		{
 			VK_LEFT = 0x25,
@@ -50,15 +94,16 @@ namespace VirtualCursor.Client
 			VK_RIGHT = 0x27,
 			VK_DOWN = 0x28,
 			VK_RSHIFT = 0xA1,
-			VK_RCONTROL = 0xA3,    // NEW: правый Ctrl
-			VK_RMENU = 0xA5,      // NEW: правый Alt
+			VK_RCONTROL = 0xA3,
+			VK_RMENU = 0xA5,
 			VK_OEM_MINUS = 0xBD,
 			VK_OEM_PLUS = 0xBB,
 			VK_LSHIFT = 0xA0,
 			VK_LCONTROL = 0xA2,
-			VK_LMENU = 0xA4,  // LAlt
+			VK_LMENU = 0xA4,
 			VK_SPACE = 0x20,
-			VK_TAB = 0x09
+			VK_TAB = 0x09,
+			VK_F12 = 0x7B
 		}
 
 		public CursorControlWindow(HolePunchUdpClient udpClient)
@@ -71,12 +116,12 @@ namespace VirtualCursor.Client
 
 		private void InitializeWindow()
 		{
-			this.WindowStyle = WindowStyle.None;
-			this.AllowsTransparency = true;
-			this.Background = Brushes.Transparent;
-			this.Topmost = true;
-			this.WindowState = WindowState.Maximized;
-			this.Title = "Virtual Cursor Client";
+			WindowStyle = WindowStyle.None;
+			AllowsTransparency = true;
+			Background = Brushes.Transparent;
+			Topmost = true;
+			WindowState = WindowState.Maximized;
+			Title = "Virtual Cursor Client - Mode: Keyboard";
 
 			var canvas = new Canvas();
 			_sprite = new Rectangle
@@ -88,7 +133,7 @@ namespace VirtualCursor.Client
 				StrokeThickness = 1
 			};
 			canvas.Children.Add(_sprite);
-			this.Content = canvas;
+			Content = canvas;
 
 			Debug.WriteLine("CursorControlWindow initialized");
 		}
@@ -108,6 +153,7 @@ namespace VirtualCursor.Client
 			_lastUpdateTime = DateTime.Now;
 			CompositionTarget.Rendering += OnRendering;
 			InstallKeyboardHook();
+			InstallMouseHook(); // всегда установлен, но обрабатываем только в режиме Mouse
 		}
 
 		private void OnSourceInitialized(object sender, EventArgs e)
@@ -117,6 +163,7 @@ namespace VirtualCursor.Client
 			SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TRANSPARENT | WS_EX_LAYERED);
 		}
 
+		// ---- Установка позиции спрайта ----
 		private void SetSpritePosition(double x, double y)
 		{
 			x = Math.Max(0, Math.Min(x, _maxX));
@@ -124,10 +171,20 @@ namespace VirtualCursor.Client
 			Canvas.SetLeft(_sprite, x);
 			Canvas.SetTop(_sprite, y);
 
-			SendCommandRel("MOVE", x, y);
+			// В режиме Keyboard отправляем MOVE (в режиме Mouse отправка происходит из хука)
+			if (_currentMode == ControlMode.Keyboard)
+				SendMove(x, y);
 		}
 
-		// ---- Отправка команд для левой кнопки (захват) ----
+		// ---- Отправка команд (относительные координаты) ----
+		private void SendMove(double x, double y)
+		{
+			double relX = x / _screenWidth;
+			double relY = y / _screenHeight;
+			var cmd = new CursorCommand("MOVE", relX, relY);
+			SendCommand(cmd);
+		}
+
 		private void SendLeftDown()
 		{
 			double x = Canvas.GetLeft(_sprite) + _spriteWidth / 2;
@@ -142,7 +199,6 @@ namespace VirtualCursor.Client
 			SendCommandRel("LEFT_UP", x, y);
 		}
 
-		// ---- NEW: отправка команд для правой кнопки ----
 		private void SendRightDown()
 		{
 			double x = Canvas.GetLeft(_sprite) + _spriteWidth / 2;
@@ -157,7 +213,6 @@ namespace VirtualCursor.Client
 			SendCommandRel("RIGHT_UP", x, y);
 		}
 
-		// ---- NEW: отправка команды Hover (кратковременное наведение) ----
 		private void SendHover()
 		{
 			double x = Canvas.GetLeft(_sprite) + _spriteWidth / 2;
@@ -167,29 +222,25 @@ namespace VirtualCursor.Client
 
 		private void SendWheel(int delta)
 		{
-			double x = Canvas.GetLeft(_sprite) + _spriteWidth / 2;
-			double y = Canvas.GetTop(_sprite) + _spriteHeight / 2;
-			var cmd = new CursorCommand("WHEEL", 0, delta); // используем Y для дельты
+			var cmd = new CursorCommand("WHEEL", 0, delta);
 			SendCommand(cmd);
 		}
 
 		private void SendKeyDown(string key)
 		{
-			double x = Canvas.GetLeft(_sprite) + _spriteWidth / 2;
-			double y = Canvas.GetTop(_sprite) + _spriteHeight / 2;
-			SendCommandRel(key + "_DOWN", x, y);
+			// Координаты не важны, но для совместимости передаём 0,0
+			var cmd = new CursorCommand(key + "_DOWN", 0, 0);
+			SendCommand(cmd);
 		}
 
 		private void SendKeyUp(string key)
 		{
-			double x = Canvas.GetLeft(_sprite) + _spriteWidth / 2;
-			double y = Canvas.GetTop(_sprite) + _spriteHeight / 2;
-			SendCommandRel(key + "_UP", x, y);
+			var cmd = new CursorCommand(key + "_UP", 0, 0);
+			SendCommand(cmd);
 		}
 
 		private void SendCommandRel(string type, double x, double y)
 		{
-			// Преобразуем в относительные координаты (0..1)
 			double relX = x / _screenWidth;
 			double relY = y / _screenHeight;
 			var cmd = new CursorCommand(type, relX, relY);
@@ -203,9 +254,38 @@ namespace VirtualCursor.Client
 			_ = _udpClient.SendToRemoteAsync(data);
 		}
 
-		// ---- Логика движения (не меняется) ----
+		// ---- Переключение режима ----
+		private void ToggleMode()
+		{
+			if (_currentMode == ControlMode.Keyboard)
+			{
+				_currentMode = ControlMode.Mouse;
+				Title = "Virtual Cursor Client - Mode: Mouse";
+				// Синхронизируем спрайт с текущей позицией мыши
+				GetCursorPos(out POINT pt);
+				SetSpritePosition(pt.x, pt.y);
+				Debug.WriteLine("Switched to Mouse mode");
+			}
+			else
+			{
+				_currentMode = ControlMode.Keyboard;
+				Title = "Virtual Cursor Client - Mode: Keyboard";
+				Debug.WriteLine("Switched to Keyboard mode");
+			}
+		}
+
+		[DllImport("user32.dll")]
+		private static extern bool GetCursorPos(out POINT lpPoint);
+
+		// ---- Движение с клавиатуры (работает только в режиме Keyboard) ----
 		private void UpdateMoveDirection()
 		{
+			if (_currentMode != ControlMode.Keyboard)
+			{
+				_moveDirection = new Vector(0, 0);
+				return;
+			}
+
 			double dx = 0, dy = 0;
 			if (_pressedKeys.Contains(VirtualKeys.VK_LEFT)) dx -= 1;
 			if (_pressedKeys.Contains(VirtualKeys.VK_RIGHT)) dx += 1;
@@ -250,7 +330,7 @@ namespace VirtualCursor.Client
 
 		private void UpdateCurrentSpeed()
 		{
-			if (_moveDirection.Length > 0)
+			if (_moveDirection.Length > 0 && _currentMode == ControlMode.Keyboard)
 			{
 				double elapsed = (DateTime.Now - _currentDirectionStartTime).TotalSeconds;
 				double t = Math.Min(1.0, Math.Max(0, elapsed / AccelerationTime));
@@ -264,6 +344,10 @@ namespace VirtualCursor.Client
 
 		private void OnRendering(object sender, EventArgs e)
 		{
+			// В режиме Mouse обновление позиции происходит через хук мыши
+			if (_currentMode == ControlMode.Mouse)
+				return;
+
 			var now = DateTime.Now;
 			double deltaSeconds = (now - _lastUpdateTime).TotalSeconds;
 			_lastUpdateTime = now;
@@ -282,39 +366,45 @@ namespace VirtualCursor.Client
 			}
 		}
 
-		#region Keyboard Hook
-		private IntPtr _hookId = IntPtr.Zero;
-		private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
-		private LowLevelKeyboardProc _proc;
-		private const int WH_KEYBOARD_LL = 13;
-		private const int WM_KEYDOWN = 0x0100;
-		private const int WM_KEYUP = 0x0101;
-		private const int WM_SYSKEYDOWN = 0x0104;
-		private const int WM_SYSKEYUP = 0x0105;
-
-		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-		private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
-
-		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
-		private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-		private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
-		[DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-		private static extern IntPtr GetModuleHandle(string lpModuleName);
-
+		// ---- Хуки ----
 		private void InstallKeyboardHook()
 		{
-			_proc = HookCallback;
+			_keyboardProc = KeyboardHookCallback;
 			using (Process curProcess = Process.GetCurrentProcess())
 			using (ProcessModule curModule = curProcess.MainModule)
 			{
-				_hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(curModule.ModuleName), 0);
+				_keyboardHookId = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc,
+					GetModuleHandle(curModule.ModuleName), 0);
 			}
 		}
 
-		private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+		private void InstallMouseHook()
+		{
+			_mouseProc = MouseHookCallback;
+			using (Process curProcess = Process.GetCurrentProcess())
+			using (ProcessModule curModule = curProcess.MainModule)
+			{
+				_mouseHookId = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc,
+					GetModuleHandle(curModule.ModuleName), 0);
+			}
+		}
+
+		private void UninstallHooks()
+		{
+			if (_keyboardHookId != IntPtr.Zero)
+			{
+				UnhookWindowsHookEx(_keyboardHookId);
+				_keyboardHookId = IntPtr.Zero;
+			}
+			if (_mouseHookId != IntPtr.Zero)
+			{
+				UnhookWindowsHookEx(_mouseHookId);
+				_mouseHookId = IntPtr.Zero;
+			}
+		}
+
+		// ---- Колбэк клавиатуры ----
+		private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
 		{
 			if (nCode >= 0)
 			{
@@ -322,45 +412,69 @@ namespace VirtualCursor.Client
 				bool isKeyDown = (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN);
 				bool isKeyUp = (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP);
 
+				// F12 переключает режим всегда
+				if (vkCode == (int)VirtualKeys.VK_F12 && isKeyDown)
+				{
+					ToggleMode();
+					return (IntPtr)1; // блокируем
+				}
+
+				if (_currentMode == ControlMode.Mouse)
+				{
+					// Пропускаем только стрелки и модификаторы, чтобы они не мешали
+					VirtualKeys key = (VirtualKeys)vkCode;
+					if (key == VirtualKeys.VK_LEFT || key == VirtualKeys.VK_RIGHT ||
+						key == VirtualKeys.VK_UP || key == VirtualKeys.VK_DOWN ||
+						key == VirtualKeys.VK_RSHIFT || key == VirtualKeys.VK_RCONTROL ||
+						key == VirtualKeys.VK_RMENU ||
+						key == VirtualKeys.VK_OEM_MINUS || key == VirtualKeys.VK_OEM_PLUS)
+					{
+						return (IntPtr)1; // блокируем все управляющие клавиши
+					}
+				}
+
 				if (isKeyDown)
 				{
 					VirtualKeys key = (VirtualKeys)vkCode;
-					// Обработка стрелок для движения
+					// Стрелки
 					if (key == VirtualKeys.VK_LEFT || key == VirtualKeys.VK_RIGHT ||
 						key == VirtualKeys.VK_UP || key == VirtualKeys.VK_DOWN)
 					{
 						_pressedKeys.Add(key);
 						UpdateMoveDirection();
-						return (IntPtr)1; // блокируем
+						return (IntPtr)1;
 					}
-					// ---- NEW: правый Shift -> RIGHT_DOWN ----
+					// Правый Shift -> RIGHT_DOWN
 					else if (key == VirtualKeys.VK_RSHIFT)
 					{
 						SendRightDown();
 						return (IntPtr)1;
 					}
-					// ---- NEW: правый Ctrl -> LEFT_DOWN (захват) ----
+					// Правый Ctrl -> LEFT_DOWN
 					else if (key == VirtualKeys.VK_RCONTROL)
 					{
 						SendLeftDown();
 						return (IntPtr)1;
 					}
-					// ---- NEW: правый Alt -> HOVER (однократно) ----
+					// Правый Alt -> HOVER
 					else if (key == VirtualKeys.VK_RMENU)
 					{
 						SendHover();
 						return (IntPtr)1;
 					}
+					// Минус -> колесо вниз
 					else if (key == VirtualKeys.VK_OEM_MINUS)
 					{
-						SendWheel(-120); // прокрутка вниз
+						SendWheel(-120);
 						return (IntPtr)1;
 					}
+					// Равно -> колесо вверх
 					else if (key == VirtualKeys.VK_OEM_PLUS)
 					{
-						SendWheel(120); // прокрутка вверх
+						SendWheel(120);
 						return (IntPtr)1;
 					}
+					// Модификаторы
 					else if (key == VirtualKeys.VK_LSHIFT)
 					{
 						SendKeyDown("LSHIFT");
@@ -390,7 +504,6 @@ namespace VirtualCursor.Client
 				else if (isKeyUp)
 				{
 					VirtualKeys key = (VirtualKeys)vkCode;
-					// Стрелки отпущены
 					if (key == VirtualKeys.VK_LEFT || key == VirtualKeys.VK_RIGHT ||
 						key == VirtualKeys.VK_UP || key == VirtualKeys.VK_DOWN)
 					{
@@ -398,19 +511,21 @@ namespace VirtualCursor.Client
 						UpdateMoveDirection();
 						return (IntPtr)1;
 					}
-					// ---- NEW: правый Shift -> RIGHT_UP ----
 					else if (key == VirtualKeys.VK_RSHIFT)
 					{
 						SendRightUp();
 						return (IntPtr)1;
 					}
-					// ---- NEW: правый Ctrl -> LEFT_UP ----
 					else if (key == VirtualKeys.VK_RCONTROL)
 					{
 						SendLeftUp();
 						return (IntPtr)1;
 					}
-					// Для правого Alt ничего не делаем при отпускании
+					else if (key == VirtualKeys.VK_RMENU)
+					{
+						// отпускание правого Alt игнорируем
+						return (IntPtr)1;
+					}
 					else if (key == VirtualKeys.VK_LSHIFT)
 					{
 						SendKeyUp("LSHIFT");
@@ -438,28 +553,78 @@ namespace VirtualCursor.Client
 					}
 				}
 			}
-			return CallNextHookEx(_hookId, nCode, wParam, lParam);
+			return CallNextHookEx(_keyboardHookId, nCode, wParam, lParam);
 		}
-		#endregion
 
+		// ---- Колбэк мыши ----
+		private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+		{
+			if (nCode >= 0 && _currentMode == ControlMode.Mouse)
+			{
+				MSLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+				int msg = (int)wParam;
+
+				// Движение мыши
+				if (msg == WM_MOUSEMOVE)
+				{
+					// Обновляем спрайт и отправляем MOVE
+					double x = hookStruct.pt.x;
+					double y = hookStruct.pt.y;
+					// Ограничиваем, чтобы спрайт не выходил за экран
+					x = Math.Max(0, Math.Min(x, _maxX));
+					y = Math.Max(0, Math.Min(y, _maxY));
+					Canvas.SetLeft(_sprite, x);
+					Canvas.SetTop(_sprite, y);
+					// Отправляем относительные координаты
+					double relX = x / _screenWidth;
+					double relY = y / _screenHeight;
+					var cmd = new CursorCommand("MOVE", relX, relY);
+					SendCommand(cmd);
+					// Блокируем событие, чтобы мышь не двигала локальный курсор
+					//return (IntPtr)1;
+					return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
+				}
+
+				// Клики и колесо
+				switch (msg)
+				{
+					case WM_LBUTTONDOWN:
+						SendLeftDown();
+						return (IntPtr)1;
+					case WM_LBUTTONUP:
+						SendLeftUp();
+						return (IntPtr)1;
+					case WM_RBUTTONDOWN:
+						SendRightDown();
+						return (IntPtr)1;
+					case WM_RBUTTONUP:
+						SendRightUp();
+						return (IntPtr)1;
+					case WM_MBUTTONDOWN:
+						// Можно добавить среднюю кнопку, если нужно
+						break;
+					case WM_MBUTTONUP:
+						break;
+					case WM_MOUSEWHEEL:
+						int delta = (short)((hookStruct.mouseData >> 16) & 0xFFFF);
+						SendWheel(delta);
+						return (IntPtr)1;
+				}
+			}
+			return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
+		}
+
+		// ---- Завершение ----
 		protected override void OnClosed(EventArgs e)
 		{
 			CompositionTarget.Rendering -= OnRendering;
-			if (_hookId != IntPtr.Zero)
-			{
-				UnhookWindowsHookEx(_hookId);
-				_hookId = IntPtr.Zero;
-			}
-
-			// Освобождаем UDP-клиент
+			UninstallHooks();
 			_udpClient?.Dispose();
-
 			base.OnClosed(e);
-
-			// Завершаем приложение
 			Application.Current?.Shutdown();
 		}
 
+		// ---- WinAPI ----
 		[DllImport("user32.dll", SetLastError = true)]
 		private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
 		[DllImport("user32.dll", SetLastError = true)]
@@ -468,7 +633,17 @@ namespace VirtualCursor.Client
 		private const int WS_EX_TRANSPARENT = 0x20;
 		private const int WS_EX_LAYERED = 0x80000;
 
-		// Контракт для обмена данными (должен быть одинаковым на клиенте и сервере)
+		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+		private static extern IntPtr SetWindowsHookEx(int idHook, Delegate lpfn, IntPtr hMod, uint dwThreadId);
+		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+		[return: MarshalAs(UnmanagedType.Bool)]
+		private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+		[DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+		private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+		[DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+		private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+		// Контракт для обмена данными
 		public record CursorCommand(
 			[property: JsonPropertyName("Type")] string Type,
 			[property: JsonPropertyName("X")] double X,

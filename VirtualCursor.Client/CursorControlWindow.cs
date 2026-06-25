@@ -33,7 +33,14 @@ namespace VirtualCursor.Client
 		private const double AccelerationTime = 0.8;
 		private DateTime _lastUpdateTime;
 
+<<<<<<< Updated upstream
 		// В начало класса, после других импортов
+=======
+		private DateTime _lastMoveSendTime = DateTime.MinValue;
+		private const double MoveSendIntervalMs = 33.0; // ~30 FPS
+
+		// ---- Разрешение экрана ----
+>>>>>>> Stashed changes
 		[DllImport("user32.dll")]
 		private static extern int GetSystemMetrics(int nIndex);
 		private const int SM_CXSCREEN = 0;
@@ -124,6 +131,17 @@ namespace VirtualCursor.Client
 			Canvas.SetLeft(_sprite, x);
 			Canvas.SetTop(_sprite, y);
 
+<<<<<<< Updated upstream
+=======
+			// В режиме Keyboard отправляем MOVE (в режиме Mouse отправка происходит из хука)
+			if (_currentMode == ControlMode.Keyboard)
+				SendMove(x, y);
+		}
+
+		// ---- Отправка команд (относительные координаты) ----
+		private void SendMove(double x, double y)
+		{
+>>>>>>> Stashed changes
 			SendCommandRel("MOVE", x, y);
 		}
 
@@ -167,9 +185,13 @@ namespace VirtualCursor.Client
 
 		private void SendWheel(int delta)
 		{
+<<<<<<< Updated upstream
 			double x = Canvas.GetLeft(_sprite) + _spriteWidth / 2;
 			double y = Canvas.GetTop(_sprite) + _spriteHeight / 2;
 			var cmd = new CursorCommand("WHEEL", 0, delta); // используем Y для дельты
+=======
+			var cmd = new CursorCommand("WHEEL", 0, (ushort)delta);
+>>>>>>> Stashed changes
 			SendCommand(cmd);
 		}
 
@@ -189,10 +211,29 @@ namespace VirtualCursor.Client
 
 		private void SendCommandRel(string type, double x, double y)
 		{
+<<<<<<< Updated upstream
 			// Преобразуем в относительные координаты (0..1)
 			double relX = x / _screenWidth;
 			double relY = y / _screenHeight;
 			var cmd = new CursorCommand(type, relX, relY);
+=======
+			// Тротлинг для MOVE команд
+			if (type == "MOVE")
+			{
+				var now = DateTime.Now;
+				if ((now - _lastMoveSendTime).TotalMilliseconds < MoveSendIntervalMs)
+					return;
+				_lastMoveSendTime = now;
+			}
+
+			// Преобразуем в относительные координаты (0..1) и сжимаем в short (0-65535)
+			double relX = Math.Clamp(x / _screenWidth, 0, 1);
+			double relY = Math.Clamp(y / _screenHeight, 0, 1);
+			ushort packedX = (ushort)(relX * 65535);
+			ushort packedY = (ushort)(relY * 65535);
+
+			var cmd = new CursorCommand(type, packedX, packedY);
+>>>>>>> Stashed changes
 			SendCommand(cmd);
 		}
 
@@ -442,6 +483,65 @@ namespace VirtualCursor.Client
 		}
 		#endregion
 
+<<<<<<< Updated upstream
+=======
+		// ---- Колбэк мыши ----
+		private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+		{
+			if (nCode >= 0 && _currentMode == ControlMode.Mouse)
+			{
+				MSLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+				int msg = (int)wParam;
+
+				// Движение мыши
+				if (msg == WM_MOUSEMOVE)
+				{
+					// Обновляем спрайт и отправляем MOVE
+					double x = hookStruct.pt.x;
+					double y = hookStruct.pt.y;
+					// Ограничиваем, чтобы спрайт не выходил за экран
+					x = Math.Max(0, Math.Min(x, _maxX));
+					y = Math.Max(0, Math.Min(y, _maxY));
+					Canvas.SetLeft(_sprite, x);
+					Canvas.SetTop(_sprite, y);
+					// Отправляем относительные координаты
+					SendMove(x, y);
+
+					//return (IntPtr)1;
+					return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
+				}
+
+				// Клики и колесо
+				switch (msg)
+				{
+					case WM_LBUTTONDOWN:
+						SendLeftDown();
+						return (IntPtr)1;
+					case WM_LBUTTONUP:
+						SendLeftUp();
+						return (IntPtr)1;
+					case WM_RBUTTONDOWN:
+						SendRightDown();
+						return (IntPtr)1;
+					case WM_RBUTTONUP:
+						SendRightUp();
+						return (IntPtr)1;
+					case WM_MBUTTONDOWN:
+						// Можно добавить среднюю кнопку, если нужно
+						break;
+					case WM_MBUTTONUP:
+						break;
+					case WM_MOUSEWHEEL:
+						int delta = (short)((hookStruct.mouseData >> 16) & 0xFFFF);
+						SendWheel(delta);
+						return (IntPtr)1;
+				}
+			}
+			return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
+		}
+
+		// ---- Завершение ----
+>>>>>>> Stashed changes
 		protected override void OnClosed(EventArgs e)
 		{
 			CompositionTarget.Rendering -= OnRendering;
@@ -473,6 +573,8 @@ namespace VirtualCursor.Client
 			[property: JsonPropertyName("Type")] string Type,
 			[property: JsonPropertyName("X")] double X,
 			[property: JsonPropertyName("Y")] double Y
+			[property: JsonPropertyName("X")] ushort X,  // было double
+			[property: JsonPropertyName("Y")] ushort Y   // было double
 		);
 	}
 }

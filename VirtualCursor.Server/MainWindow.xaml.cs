@@ -197,9 +197,11 @@ namespace VirtualCursor.Server
 			}
 		}
 
-		private Point ConverseNormalPoint(double x, double y)
+		private Point ConverseNormalPoint(ushort x, ushort y)
 		{
-			return new Point(x * _screenWidth, y * _screenHeight);
+			double relX = x / 65535.0;
+			double relY = y / 65535.0;
+			return new Point(relX * _screenWidth, relY * _screenHeight);
 		}
 
 		// -------------------- Обработка команд от клиента --------------------
@@ -607,7 +609,7 @@ namespace VirtualCursor.Server
 
 	public record CursorCommand(
 		[property: JsonPropertyName("Type")] string Type,
-		[property: JsonPropertyName("X")] double X,
-		[property: JsonPropertyName("Y")] double Y
+		[property: JsonPropertyName("X")] ushort X,  // было double
+		[property: JsonPropertyName("Y")] ushort Y   // было double
 	);
 }

@@ -329,7 +329,7 @@ namespace VirtualCursor.Server
 			// Перемещаем системный курсор на позицию удалённого курсора
 			SetSystemCursorPosition(_remoteCursorPos);
 			_isTakedByRemote = true;
-			await Task.Delay(50);
+			await Task.Delay(30);
 			mouse_event_emulated(MOUSEEVENTF_LEFTDOWN, 0, 0);
 			_isBlockedByRemote = true;
 		}
@@ -362,7 +362,7 @@ namespace VirtualCursor.Server
 			// Перемещаем системный курсор на позицию удалённого курсора
 			SetSystemCursorPosition(_remoteCursorPos);
 			_isTakedByRemote = true;
-			await Task.Delay(50);
+			await Task.Delay(30);
 			mouse_event_emulated(MOUSEEVENTF_RIGHTDOWN, 0, 0);
 			_isBlockedByRemote = true;
 		}

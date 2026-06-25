@@ -35,6 +35,9 @@ namespace VirtualCursor.Client
 		private const double AccelerationTime = 0.8;
 		private DateTime _lastUpdateTime;
 
+		private DateTime _lastMoveSendTime = DateTime.MinValue;
+		private const double MoveSendIntervalMs = 33.0; // ~30 FPS
+
 		// ---- Разрешение экрана ----
 		[DllImport("user32.dll")]
 		private static extern int GetSystemMetrics(int nIndex);
@@ -179,10 +182,12 @@ namespace VirtualCursor.Client
 		// ---- Отправка команд (относительные координаты) ----
 		private void SendMove(double x, double y)
 		{
-			double relX = x / _screenWidth;
-			double relY = y / _screenHeight;
-			var cmd = new CursorCommand("MOVE", relX, relY);
-			SendCommand(cmd);
+			var now = DateTime.Now;
+			if ((now - _lastMoveSendTime).TotalMilliseconds < MoveSendIntervalMs)
+				return;
+			_lastMoveSendTime = now;
+
+			SendCommandRel("MOVE", x,y);
 		}
 
 		private void SendLeftDown()
@@ -222,7 +227,7 @@ namespace VirtualCursor.Client
 
 		private void SendWheel(int delta)
 		{
-			var cmd = new CursorCommand("WHEEL", 0, delta);
+			var cmd = new CursorCommand("WHEEL", 0, (ushort)delta);
 			SendCommand(cmd);
 		}
 
@@ -241,9 +246,13 @@ namespace VirtualCursor.Client
 
 		private void SendCommandRel(string type, double x, double y)
 		{
-			double relX = x / _screenWidth;
-			double relY = y / _screenHeight;
-			var cmd = new CursorCommand(type, relX, relY);
+			// Преобразуем в относительные координаты (0..1) и сжимаем в short (0-65535)
+			double relX = Math.Clamp(x / _screenWidth, 0, 1);
+			double relY = Math.Clamp(y / _screenHeight, 0, 1);
+			ushort packedX = (ushort)(relX * 65535);
+			ushort packedY = (ushort)(relY * 65535);
+
+			var cmd = new CursorCommand(type, packedX, packedY);
 			SendCommand(cmd);
 		}
 
@@ -576,10 +585,7 @@ namespace VirtualCursor.Client
 					Canvas.SetLeft(_sprite, x);
 					Canvas.SetTop(_sprite, y);
 					// Отправляем относительные координаты
-					double relX = x / _screenWidth;
-					double relY = y / _screenHeight;
-					var cmd = new CursorCommand("MOVE", relX, relY);
-					SendCommand(cmd);
+					SendMove(x, y);
 					// Блокируем событие, чтобы мышь не двигала локальный курсор
 					//return (IntPtr)1;
 					return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
@@ -646,8 +652,8 @@ namespace VirtualCursor.Client
 		// Контракт для обмена данными
 		public record CursorCommand(
 			[property: JsonPropertyName("Type")] string Type,
-			[property: JsonPropertyName("X")] double X,
-			[property: JsonPropertyName("Y")] double Y
+			[property: JsonPropertyName("X")] ushort X,  // было double
+			[property: JsonPropertyName("Y")] ushort Y   // было double
 		);
 	}
 }

@@ -1,0 +1,27 @@
+﻿<Window x:Class="VirtualCursor.Client.CursorControlWindow"
+xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+xmlns:local="clr-namespace:VirtualCursor.Client"
+Title="Virtual Cursor Client" Height="450" Width="800"
+WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True"
+WindowState="Maximized">
+    <Grid>
+        <!-- Контейнер для изображения экрана -->
+        <Canvas Name="ScreenCanvas" Background="Black">
+            <Image Name="ScreenImage" Canvas.Left="0" Canvas.Top="0" 
+                   Stretch="None" RenderOptions.BitmapScalingMode="HighQuality"/>
+            <!-- Спрайт удалённого курсора -->
+            <Rectangle Name="RemoteSprite" 
+Width="32" Height="32" 
+Fill="Red" Stroke="Black" StrokeThickness="2"
+Canvas.Left="0" Canvas.Top="0"/>
+        </Canvas>
+        <!-- Информация о состоянии -->
+        <StackPanel HorizontalAlignment="Right" VerticalAlignment="Top" 
+Margin="10" Background="#80000000"
+Panel.ZIndex="999">
+            <TextBlock Name="StatusText" Foreground="White" FontSize="12"/>
+            <TextBlock Name="StatsText" Foreground="#88FFFFFF" FontSize="10"/>
+        </StackPanel>
+    </Grid>
+</Window>

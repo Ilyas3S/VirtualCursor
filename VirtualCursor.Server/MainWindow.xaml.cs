@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using VirtualCursor.Common;
@@ -136,6 +137,10 @@ namespace VirtualCursor.Server
 		private static string GenerateShortSessionId() =>
 			new string(Enumerable.Range(0, 6).Select(_ => "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[_random.Next(36)]).ToArray());
 
+		private ScreenCaptureService _captureService;
+		private ScreenFrameSender _frameSender;
+		private bool _isStreaming = false;
+
 		public MainWindow()
 		{
 			InitializeComponent();
@@ -144,6 +149,28 @@ namespace VirtualCursor.Server
 			Closed += OnClosed;
 			// В конструкторе или OnLoaded подписываемся на рендеринг
 			CompositionTarget.Rendering += OnRendering;
+
+			// Подписка на события слайдеров
+			FpsSlider.ValueChanged += FpsSlider_ValueChanged;
+			QualitySlider.ValueChanged += QualitySlider_ValueChanged;
+			ScaleSlider.ValueChanged += ScaleSlider_ValueChanged;
+
+			// Клавиша F12 для показа/скрытия настроек
+			this.KeyDown += (s, e) => {
+				if (e.Key == Key.F12)
+				{
+					if (SettingsPanel.Visibility == Visibility.Visible)
+					{
+						SettingsPanel.Visibility = Visibility.Collapsed;
+						ToggleTransparency(true); // Включаем прозрачность обратно
+					}
+					else
+					{
+						SettingsPanel.Visibility = Visibility.Visible;
+						ToggleTransparency(false); // Отключаем прозрачность
+					}
+				}
+			};
 		}
 
 		private void OnLoaded(object sender, RoutedEventArgs e)
@@ -178,6 +205,122 @@ namespace VirtualCursor.Server
 			SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TRANSPARENT | WS_EX_LAYERED);
 		}
 
+		private void ToggleTransparency(bool enable)
+		{
+			var hwnd = new WindowInteropHelper(this).Handle;
+			int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+
+			if (enable)
+			{
+				// Включаем прозрачность (клики проходят сквозь)
+				exStyle |= WS_EX_TRANSPARENT | WS_EX_LAYERED;
+			}
+			else
+			{
+				// Отключаем прозрачность (окно получает клики)
+				exStyle &= ~WS_EX_TRANSPARENT;
+				exStyle &= ~WS_EX_LAYERED;
+			}
+
+			SetWindowLong(hwnd, GWL_EXSTYLE, exStyle);
+		}
+
+
+		// ---- Настройки трансляции ----
+		private void FpsSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+		{
+			if (_frameSender != null && _isStreaming)
+			{
+				_frameSender.Stop();
+				_frameSender.Start((int)FpsSlider.Value);
+			}
+		}
+
+		private void QualitySlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+		{
+			if (_captureService != null)
+			{
+				_captureService.SetQuality((byte)QualitySlider.Value);
+			}
+		}
+
+		private void ScaleSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+		{
+			if (_captureService != null)
+			{
+				_captureService.SetScaleFactor((int)ScaleSlider.Value);
+			}
+		}
+
+		private void StreamToggle_Checked(object sender, RoutedEventArgs e)
+		{
+			StartStreaming();
+		}
+
+		private void StreamToggle_Unchecked(object sender, RoutedEventArgs e)
+		{
+			StopStreaming();
+		}
+
+		private void StartStreaming()
+		{
+			if (_isStreaming || _udpClient == null) return;
+
+			try
+			{
+				// Создаём сервис захвата
+				int scale = (int)ScaleSlider.Value;
+				byte quality = (byte)QualitySlider.Value;
+				_captureService = new ScreenCaptureService(scale, quality);
+
+				// Создаём и запускаем отправитель
+				_frameSender = new ScreenFrameSender(_udpClient, _captureService);
+				_frameSender.OnFrameStats += OnFrameStats;
+				_frameSender.Start((int)FpsSlider.Value);
+
+				_isStreaming = true;
+				StreamToggle.Content = "Выключить";
+				StatusText.Text = "Трансляция экрана активна";
+
+				Debug.WriteLine("Streaming started");
+			}
+			catch (Exception ex)
+			{
+				StatusText.Text = $"StartStreaming Error: {ex.Message}";
+			}
+		}
+
+		private void StopStreaming()
+		{
+			if (!_isStreaming) return;
+
+			try
+			{
+				_frameSender?.Stop();
+				_frameSender?.Dispose();
+				_frameSender = null;
+				_captureService?.Dispose();
+				_captureService = null;
+
+				_isStreaming = false;
+				StreamToggle.Content = "Включить";
+				StatusText.Text = "Трансляция остановлена";
+
+				Debug.WriteLine("Streaming stopped");
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine($"StopStreaming Error: {ex.Message}");
+			}
+		}
+
+		private void OnFrameStats(int fps, int blocks)
+		{
+			Dispatcher.Invoke(() =>
+			{
+				StatsText.Text = $"FPS: {fps} | Блоков/сек: {blocks}";
+			});
+		}
 
 		private void UpdateSprites()
 		{
@@ -479,7 +622,12 @@ namespace VirtualCursor.Server
 			// Сообщаем свой публичный адрес (через broadcast, чтобы клиенты знали)
 			string publicAddr = $"{_udpClient.PublicEndPoint.Address}:{_udpClient.PublicEndPoint.Port}";
 			await _signalingClient.SendSignalAsync("broadcast", "server_info", publicAddr);
-			Dispatcher.Invoke(() => StatusTextBlock.Text = $"Сервер готов. Публичный адрес: {publicAddr}");
+			Dispatcher.Invoke(() => StatusText.Text = $"Сервер готов. Публичный адрес: {publicAddr}");
+
+			if (StreamToggle.IsChecked == true)
+			{
+				Dispatcher.Invoke(() => StartStreaming());
+			}
 		}
 
 		private async Task OnSignalReceived(string type, string data)
@@ -496,7 +644,7 @@ namespace VirtualCursor.Server
 				string publicAddr = $"{_udpClient.PublicEndPoint.Address}:{_udpClient.LocalEndPoint.Port}";
 				await _signalingClient.SendCandidateAsync(clientSessionId, publicAddr);
 				// Также сообщаем клиенту, что можем принять пакеты
-				Dispatcher.Invoke(() => StatusTextBlock.Text = $"Отправил клиенту {clientSessionId} адрес {publicAddr}");
+				Dispatcher.Invoke(() => StatusText.Text = $"Отправил клиенту {clientSessionId} адрес {publicAddr}");
 			}
 			else if (type == "candidate")
 			{
@@ -513,13 +661,15 @@ namespace VirtualCursor.Server
 
 					var clientEndPoint = new IPEndPoint(ip, port);
 					_udpClient.SetRemotePublicEndPoint(clientEndPoint);
-					Dispatcher.Invoke(() => StatusTextBlock.Text = $"Начинаем hole punching с клиентом {clientEndPoint}");
+					Dispatcher.Invoke(() => StatusText.Text = $"Начинаем hole punching с клиентом {clientEndPoint}");
 				}
 			}
 		}
 
 		private async void OnClosed(object sender, EventArgs e)
 		{
+			ToggleTransparency(true);
+			StopStreaming();
 			RemoveFirewallRule();
 			_udpClient?.Dispose();
 			if (_signalingClient != null) await _signalingClient.DisconnectAsync();

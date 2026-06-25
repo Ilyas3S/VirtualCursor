@@ -571,8 +571,6 @@ namespace VirtualCursor.Client
 		// Контракт для обмена данными (должен быть одинаковым на клиенте и сервере)
 		public record CursorCommand(
 			[property: JsonPropertyName("Type")] string Type,
-			[property: JsonPropertyName("X")] double X,
-			[property: JsonPropertyName("Y")] double Y
 			[property: JsonPropertyName("X")] ushort X,  // было double
 			[property: JsonPropertyName("Y")] ushort Y   // было double
 		);
